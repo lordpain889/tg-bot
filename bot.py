@@ -1,8 +1,9 @@
+import asyncio
 import logging
 import os
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import APIConnectionError, APIError, OpenAI, RateLimitError
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -24,12 +25,19 @@ logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = "You are a helpful assistant."
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "20"))
+OPENAI_RETRY_ATTEMPTS = int(os.getenv("OPENAI_RETRY_ATTEMPTS", "3"))
 
 
 def get_history(context: ContextTypes.DEFAULT_TYPE) -> list[dict[str, str]]:
     if "history" not in context.user_data:
         context.user_data["history"] = []
     return context.user_data["history"]
+
+
+def trim_history(history: list[dict[str, str]]) -> None:
+    if MAX_HISTORY_MESSAGES > 0 and len(history) > MAX_HISTORY_MESSAGES:
+        del history[:-MAX_HISTORY_MESSAGES]
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -47,23 +55,41 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None or update.message.text is None:
+        return
     user_message = update.message.text
     history = get_history(context)
 
     history.append({"role": "user", "content": user_message})
+    trim_history(history)
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
 
     try:
-        response = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=messages,
-        )
+        response = None
+        for attempt in range(1, max(1, OPENAI_RETRY_ATTEMPTS) + 1):
+            try:
+                response = client.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=messages,
+                )
+                break
+            except (RateLimitError, APIConnectionError, APIError) as exc:
+                if attempt >= max(1, OPENAI_RETRY_ATTEMPTS):
+                    raise
+                wait_seconds = 0.8 * attempt
+                logger.warning("OpenAI temporary error (%s). Retrying in %.1fs...", exc.__class__.__name__, wait_seconds)
+                await asyncio.sleep(wait_seconds)
+
+        if response is None:
+            raise RuntimeError("OpenAI response is unavailable after retries.")
         assistant_message = response.choices[0].message.content or "I don't have a response right now."
         history.append({"role": "assistant", "content": assistant_message})
+        trim_history(history)
         await update.message.reply_text(assistant_message)
     except Exception:
         logger.exception("OpenAI API error")
-        history.pop()
+        if history:
+            history.pop()
         await update.message.reply_text("Sorry, I encountered an error. Please try again.")
 
 
